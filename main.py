@@ -83,7 +83,8 @@ def loss_fn(model, observations, actions, values, actions_log_probs, advantages,
     entropy_loss = jnp.mean(pi.entropy())
     return policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
 
-def _calculate_gae(rewards, values, dones, last_val):
+def calculate_gae_returns(rewards, values, dones, last_value):
+    """ adapted from https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo.py#L142 """
     def _get_advantages(gae_and_next_value, reward_value_done):
         gae, next_value = gae_and_next_value
         reward, value, done = reward_value_done
@@ -93,7 +94,7 @@ def _calculate_gae(rewards, values, dones, last_val):
 
     _, advantages = jax.lax.scan(
         _get_advantages,
-        (jnp.zeros_like(last_val), last_val),
+        (jnp.zeros_like(last_value), last_value),
         (rewards, values, dones),
         reverse=True, # scanning the trajectory batch in reverse order
     )
@@ -153,7 +154,7 @@ for iteration in range(ITERATIONS):
     # advantages = jnp.array(advantages)
     # returns = advantages + value_estimates
 
-    advantages, returns = _calculate_gae(rewards, value_estimates, dones, last_value)
+    advantages, returns = calculate_gae_returns(rewards, value_estimates, dones, last_value)
 
     print("iter mean reward", jnp.mean(rewards))
 
