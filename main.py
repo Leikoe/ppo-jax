@@ -7,10 +7,11 @@ import optax
 from flax import nnx
 from flax.nnx.nn.initializers import constant, orthogonal
 
+SEED = 7
 BATCH_SIZE = 256
 MAX_STEPS = 1024
 NUM_ENVS = 16
-ITERATIONS = 1
+ITERATIONS = 50
 K = 5
 EPS = 0.1
 DISCOUNT_FACTOR = 0.99
@@ -88,7 +89,6 @@ class Model(nnx.Module):
         return distrax.Categorical(logits), self.value(x)
 
 
-@nnx.jit
 def get_action_logprobs_value(
     model: Model, obs: jax.Array, key: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -97,7 +97,6 @@ def get_action_logprobs_value(
     return action, pi.log_prob(action), value
 
 
-@nnx.jit
 def get_value(model: Model, obs: jax.Array) -> jax.Array:
     return model(obs)[1]
 
@@ -107,7 +106,6 @@ def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array:
     return model(obs)[0].sample(seed=key)
 
 
-@nnx.jit
 def loss_fn(
     model, observations, actions, values, actions_log_probs, advantages, returns
 ):
@@ -167,7 +165,7 @@ def calculate_gae_returns(
 
 
 def step_once(carry, _):
-    (model_state, env_state, key, last_observation) = carry
+    (key, model_state, env_state, last_observation) = carry
     model = nnx.merge(*model_state)
 
     key, subkey = jax.random.split(key)
@@ -181,7 +179,7 @@ def step_once(carry, _):
     # observation, state = jnp.where(done, vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params), (observation, env_state))
     # if done:
     #     observation, _ = env.reset()
-    return (model_state, env_state, key, observation), (
+    return (key, model_state, env_state, observation), (
         observation,
         value.flatten(),
         action,
@@ -191,36 +189,29 @@ def step_once(carry, _):
     )
 
 
-SEED = 7
-key = jax.random.key(SEED)
-# init envs
 env, env_params = gymnax.make(ENV_NAME)
 vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
 vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
+
+key = jax.random.key(SEED)
 model = Model(6, 128, 3)  # Acrobot has obs (6,) and action (1,) in [0,3] range
-optimizer = nnx.Optimizer(
-    model,
-    optax.chain(
-        optax.clip_by_global_norm(0.5),
-        optax.adamw(1e-3),
-    ),
-)  # reference sharing
+optimizer = optax.chain(
+    optax.clip_by_global_norm(0.5),
+    optax.adamw(1e-3),
+)
+optimizer_state = optimizer.init(nnx.state(model, nnx.Param))
 
-value_and_grad_loss_fn = nnx.value_and_grad(loss_fn)
 
-jitted_calculate_gae_returns = jax.jit(calculate_gae_returns)
+@jax.jit
+def iter_once(carry, i):
+    key, model_state, optimizer_state = carry
+    jax.debug.print("iteration {i}", i=i)
 
-for iteration in range(ITERATIONS):
-    print(f"{iteration=}")
-    # single actor for now so no loop
     # Run policy πθold in environment for T timesteps
-    init_keys = jax.random.split(key, NUM_ENVS)
-    observation, state = vmap_reset(init_keys, env_params)
-
-    model_state = nnx.split(model)  # graphdef, state
-    (_, _, key, last_observation), trajectory = jax.lax.scan(
-        step_once, (model_state, state, key, observation), length=MAX_STEPS
+    observation, env_state = vmap_reset(jax.random.split(key, NUM_ENVS), env_params)
+    (key, _, _, last_observation), trajectory = jax.lax.scan(
+        step_once, (key, model_state, env_state, observation), length=MAX_STEPS
     )
 
     (observations, values, actions, log_probs, rewards, dones) = jax.tree.map(
@@ -229,34 +220,47 @@ for iteration in range(ITERATIONS):
     )  # (NUM_ENVS, MAX_STEPS, *)
 
     last_value = get_value(
-        model, last_observation
+        nnx.merge(*model_state), last_observation
     ).flatten()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-    advantages, returns = jitted_calculate_gae_returns(
+    advantages, returns = calculate_gae_returns(
         rewards, values, dones, last_value
     )  # (T, N)
 
     # flatten NUM_ENVS * MAX_STEPS of experience
-    (observations, values, actions, log_probs, rewards, dones, advantages, returns) = (
-        jax.tree.map(
-            lambda x: x.flatten()
-            if len(x.shape) == 2
-            else x.reshape(MAX_STEPS * NUM_ENVS, -1),
-            (*trajectory, advantages, returns),
-        )
+    (
+        observations,
+        values,
+        actions,
+        log_probs,
+        rewards,
+        dones,
+        advantages,
+        returns,
+    ) = jax.tree.map(
+        lambda x: x.flatten()
+        if len(x.shape) == 2
+        else x.reshape(MAX_STEPS * NUM_ENVS, -1),
+        (*trajectory, advantages, returns),
     )  # (NUM_ENVS * MAX_STEPS, *)
 
-    print("iter mean reward", jnp.mean(rewards))
+    jax.debug.print("iter mean reward {r}", r=jnp.mean(rewards))
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
-    for epoch in range(K):
-        key, _key = jax.random.split(key)
-        idxs = jax.random.permutation(_key, jnp.arange(0, NUM_ENVS * MAX_STEPS))
+    def one_epoch(carry, epoch):
+        (key, model_state, optimizer_state) = carry
+        jax.debug.print("epoch {epoch}", epoch=epoch)
+
+        key, subkey = jax.random.split(key)
+        idxs = jax.random.permutation(subkey, jnp.arange(NUM_ENVS * MAX_STEPS))
         batches_idxs = idxs.reshape(-1, BATCH_SIZE)
-        for batch_i in range(NUM_ENVS * MAX_STEPS // BATCH_SIZE):
-            batch_idxs = batches_idxs[batch_i]
-            loss, grads = value_and_grad_loss_fn(
+
+        def one_batch(carry, batch_idxs):
+            (model_state, optimizer_state) = carry
+            model = nnx.merge(*model_state)
+
+            loss, grads = nnx.value_and_grad(loss_fn)(
                 model,
                 observations[batch_idxs],
                 actions[batch_idxs],
@@ -265,7 +269,34 @@ for iteration in range(ITERATIONS):
                 advantages[batch_idxs],
                 returns[batch_idxs],
             )
-            optimizer.update(grads)  # inplace updates
+
+            # pure optax update
+            current_params = nnx.state(model, nnx.Param)
+            updates, optimizer_state = optimizer.update(
+                grads, optimizer_state, current_params
+            )
+            new_params = optax.apply_updates(current_params, updates)
+            nnx.update(model, new_params)
+
+            return (nnx.split(model), optimizer_state), None
+
+        (model_state, optimizer_state), _ = jax.lax.scan(
+            one_batch, (model_state, optimizer_state), batches_idxs
+        )
+
+        return (key, model_state, optimizer_state), None
+
+    (key, model_state, optimizer_state), _ = jax.lax.scan(
+        one_epoch, (key, model_state, optimizer_state), jnp.arange(K)
+    )
+    return (key, model_state, optimizer_state), None
+
+
+(key, model_state, optimizer_state), _ = jax.lax.scan(
+    iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
+)
+model = nnx.merge(*model_state)
+
 
 # EVAL
 import gymnasium as gym
