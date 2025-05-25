@@ -174,7 +174,7 @@ def step_once(carry, _):
         action,
         log_prob,
         reward,
-        done,
+        jnp.where(done, 1, 0),
     )
 
 
