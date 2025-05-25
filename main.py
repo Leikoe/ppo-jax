@@ -238,7 +238,7 @@ def iter_once(carry, i):
         jax.debug.print("epoch {epoch}", epoch=epoch)
 
         key, subkey = jax.random.split(key)
-        idxs = jax.random.permutation(subkey, jnp.arange(NUM_ENVS * MAX_STEPS))
+        idxs = jax.random.permutation(subkey, NUM_ENVS * MAX_STEPS)
         batches_idxs = idxs.reshape(-1, BATCH_SIZE)
 
         def one_batch(carry, batch_idxs):
