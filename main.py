@@ -5,8 +5,8 @@ import jax.numpy as jnp
 from tqdm import tqdm
 import numpy as np
 
-orthogonal = nnx.initializers.orthogonal
-constant = nnx.initializers.constant
+orthogonal = nnx.nn.initializers.orthogonal
+constant = nnx.nn.initializers.constant
 
 BATCH_SIZE = 64
 MAX_STEPS = 256
@@ -51,8 +51,9 @@ def get_action_logprobs_value(model: Model, obs: jax.Array, key: jax.Array) -> t
 @nnx.jit
 def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array: return model(obs)[0].sample(seed=key)
 
-@nnx.jit
+# @nnx.jit
 def loss_fn(model, observations, actions, values, actions_log_probs, advantages, returns):
+
     observations = jax.lax.stop_gradient(observations)
     actions = jax.lax.stop_gradient(actions)
     values = jax.lax.stop_gradient(values)
@@ -63,25 +64,16 @@ def loss_fn(model, observations, actions, values, actions_log_probs, advantages,
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     pi, value = model(observations)
+    value = value.flatten()
 
     prob_ratio = jnp.exp(pi.log_prob(actions) - actions_log_probs) # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
 
     policy_loss = -jnp.mean(jnp.minimum( # loss is -L_CLIP because we want to maximize L_CLIP but using gradient descent
         prob_ratio * advantages, jnp.clip(prob_ratio, min=1.0-EPS, max=1.0+EPS) * advantages
     ))
-    # value_loss = jnp.mean(jnp.square(value - returns))
-
-    value_pred_clipped = values + (
-        value - values
-    ).clip(-EPS, EPS)
-    value_losses = jnp.square(value - returns)
-    value_losses_clipped = jnp.square(value_pred_clipped - returns)
-    value_loss = (
-        0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-    )
-
-    entropy_loss = jnp.mean(pi.entropy())
-    return policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+    value_loss = jnp.mean(jnp.square(value - returns))
+    entropy_loss = -jnp.mean(pi.entropy())
+    return policy_loss + 0.5 * value_loss + 0.0 * entropy_loss
 
 def calculate_gae_returns(rewards, values, dones, last_value):
     """ adapted from https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo.py#L142 """
@@ -104,7 +96,11 @@ SEED = 7
 key = jax.random.key(SEED)
 env = gym.make("LunarLander-v3")
 model = Model(8, 128, 4) # lunar lander has obs (8,) and action(1,) in [0,3] range
-optimizer = nnx.Optimizer(model, optax.adam(0.001))  # reference sharing
+optimizer = nnx.Optimizer(model,optax.chain(
+  optax.clip(0.5),
+  optax.adamw(1e-3),
+))  # reference sharing
+
 value_and_grad_loss_fn = nnx.value_and_grad(loss_fn)
 
 for iteration in range(ITERATIONS):
@@ -116,13 +112,15 @@ for iteration in range(ITERATIONS):
     rewards = []
     dones = []
 
+    done_rewards = []
+
     # single actor for now so no loop
     # Run policy πθold in environment for T timesteps
     observation, _ = env.reset()
     for step in tqdm(range(MAX_STEPS)):
         key, subkey = jax.random.split(key)
         action, log_probs, value = get_action_logprobs_value(model, observation, subkey)
-        action = action.item()
+        action, value = action.item(), value.item()
 
         observations.append(observation)
         value_estimates.append(value)
@@ -133,9 +131,10 @@ for iteration in range(ITERATIONS):
 
         dones.append(terminated or truncated)
         if terminated or truncated:
+            done_rewards.append(reward)
             observation, _ = env.reset()
     key, subkey = jax.random.split(key)
-    last_value = get_action_logprobs_value(model, observation, subkey)[2] # one more required for gae's deltas
+    last_value = get_action_logprobs_value(model, observation, subkey)[2].item() # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
     # deltas: list[float] = [r + DISCOUNT_FACTOR * (1 - d) * nv - v for r, v, nv, d in zip(rewards, value_estimates[:-1], value_estimates[1:], dones)]
@@ -151,16 +150,19 @@ for iteration in range(ITERATIONS):
     actions_log_probs = jnp.array(actions_log_probs)
     rewards = jnp.array(rewards)
     dones = jnp.array(dones)
+    # print(observations.shape, value_estimates.shape, actions.shape, rewards.shape, dones.shape)
+
     # advantages = jnp.array(advantages)
     # returns = advantages + value_estimates
 
     advantages, returns = calculate_gae_returns(rewards, value_estimates, dones, last_value)
 
     print("iter mean reward", jnp.mean(rewards))
+    print(f"done rewards {done_rewards}")
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     for epoch in range(K):
-        print(f"{epoch=}")
+        # print(f"{epoch=}")
         for batch in range(len(observations) // BATCH_SIZE):
             key, _key = jax.random.split(key)
             batch_idxs = jax.random.randint(_key, shape=(BATCH_SIZE,), minval=0, maxval=len(observations))
@@ -168,14 +170,14 @@ for iteration in range(ITERATIONS):
             optimizer.update(grads)  # inplace updates
 env.close()
 
-# EVAL
-env = gym.make("LunarLander-v3", render_mode="human")
+# # EVAL
+# env = gym.make("LunarLander-v3", render_mode="human")
 
-observation, _ = env.reset(seed=42)
-for _ in range(1000):
-    key, subkey = jax.random.split(key)
-    action = get_action(model, observation, subkey).item()
-    observation, reward, terminated, truncated, _ = env.step(action)
-    if terminated or truncated: observation, _ = env.reset()
+# observation, _ = env.reset(seed=42)
+# for _ in range(1000):
+#     key, subkey = jax.random.split(key)
+#     action = get_action(model, observation, subkey).item()
+#     observation, reward, terminated, truncated, _ = env.step(action)
+#     if terminated or truncated: observation, _ = env.reset()
 
-env.close()
+# env.close()
