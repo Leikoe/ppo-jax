@@ -97,9 +97,7 @@ class Model(nnx.Module):
         return distrax.Categorical(logits), self.value(x)
 
 
-def get_action_logprobs_value(
-    model: Model, obs: jax.Array, key: jax.Array
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+def get_action_logprobs_value(model: Model, obs: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     pi, value = model(obs)
     action = pi.sample(seed=key)
     return action, pi.log_prob(action), value
@@ -114,19 +112,13 @@ def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array:
     return model(obs)[0].sample(seed=key)
 
 
-def loss_fn(
-    model, observations, actions, values, actions_log_probs, advantages, returns
-):
-    advantages = (advantages - advantages.mean()) / (
-        advantages.std() + 1e-8
-    )  # standardize advantages
+def loss_fn(model, observations, actions, values, actions_log_probs, advantages, returns):
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # standardize advantages
 
     pi, value = model(observations)
     value = value.flatten()
 
-    prob_ratio = jnp.exp(
-        pi.log_prob(actions) - actions_log_probs
-    )  # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
+    prob_ratio = jnp.exp(pi.log_prob(actions) - actions_log_probs)  # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
 
     policy_loss = -jnp.mean(
         jnp.minimum(
@@ -174,9 +166,7 @@ def step_once(carry, _):
     action, log_prob, value = get_action_logprobs_value(model, last_observation, subkey)
 
     # Automatic env resetting in gymnax step!
-    observation, env_state, reward, done, _ = vmap_step(
-        jax.random.split(subkey, NUM_ENVS), env_state, action, env_params
-    )
+    observation, env_state, reward, done, _ = vmap_step(jax.random.split(subkey, NUM_ENVS), env_state, action, env_params)
 
     return (key, model_state, env_state, observation), (
         observation,
@@ -196,22 +186,14 @@ def iter_once(carry, i):
 
     # Run policy πθold in environment for T timesteps
     observation, env_state = vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params)
-    (key, _, _, last_observation), trajectory = jax.lax.scan(
-        step_once, (key, model_state, env_state, observation), length=MAX_STEPS
-    )
+    (key, _, _, last_observation), trajectory = jax.lax.scan(step_once, (key, model_state, env_state, observation), length=MAX_STEPS)
 
-    observations, values, actions, log_probs, rewards, dones = (
-        trajectory  # (MAX_STEPS, NUM_ENVS, *)
-    )
+    observations, values, actions, log_probs, rewards, dones = trajectory  # (MAX_STEPS, NUM_ENVS, *)
 
-    last_value = get_value(
-        nnx.merge(*model_state), last_observation
-    ).flatten()  # one more required for gae's deltas
+    last_value = get_value(nnx.merge(*model_state), last_observation).flatten()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-    advantages, returns = calculate_gae_returns(
-        rewards, values, dones, last_value
-    )  # (T, N)
+    advantages, returns = calculate_gae_returns(rewards, values, dones, last_value)  # (T, N)
 
     # flatten NUM_ENVS * MAX_STEPS of experience
     (
@@ -224,9 +206,7 @@ def iter_once(carry, i):
         advantages,
         returns,
     ) = jax.tree.map(
-        lambda x: x.flatten()
-        if len(x.shape) == 2
-        else x.reshape(MAX_STEPS * NUM_ENVS, -1),
+        lambda x: x.flatten() if len(x.shape) == 2 else x.reshape(MAX_STEPS * NUM_ENVS, -1),
         (*trajectory, advantages, returns),
     )  # (NUM_ENVS * MAX_STEPS, *)
 
@@ -257,23 +237,17 @@ def iter_once(carry, i):
 
             # pure optax update
             current_params = nnx.state(model, nnx.Param)
-            updates, optimizer_state = OPTIMIZER.update(
-                grads, optimizer_state, current_params
-            )
+            updates, optimizer_state = OPTIMIZER.update(grads, optimizer_state, current_params)
             new_params = optax.apply_updates(current_params, updates)
             nnx.update(model, new_params)
 
             return (nnx.split(model), optimizer_state), None
 
-        (model_state, optimizer_state), _ = jax.lax.scan(
-            one_batch, (model_state, optimizer_state), batches_idxs
-        )
+        (model_state, optimizer_state), _ = jax.lax.scan(one_batch, (model_state, optimizer_state), batches_idxs)
 
         return (key, model_state, optimizer_state), None
 
-    (key, model_state, optimizer_state), _ = jax.lax.scan(
-        one_epoch, (key, model_state, optimizer_state), jnp.arange(K)
-    )
+    (key, model_state, optimizer_state), _ = jax.lax.scan(one_epoch, (key, model_state, optimizer_state), jnp.arange(K))
     return (key, model_state, optimizer_state), None
 
 
@@ -281,9 +255,7 @@ if __name__ == "__main__":
     key = jax.random.key(SEED)
     model = Model(4, 128, 2)  # Acrobot has obs (6,) and action (1,) in [0,3] range
     optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
-    (key, model_state, optimizer_state), _ = jax.lax.scan(
-        iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
-    )
+    (key, model_state, optimizer_state), _ = jax.lax.scan(iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS))
     model = nnx.merge(*model_state)
 
     # EVAL
