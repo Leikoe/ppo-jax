@@ -160,8 +160,8 @@ def calculate_gae_returns(rewards, values, dones, last_value):
 
 SEED = 7
 key = jax.random.key(SEED)
-env = gym.make("LunarLander-v3")
-model = Model(8, 128, 4)  # lunar lander has obs (8,) and action(1,) in [0,3] range
+env = gym.make("CartPole-v1")
+model = Model(4, 128, 2)
 optimizer = nnx.Optimizer(
     model,
     optax.chain(
@@ -219,7 +219,7 @@ for iteration in range(ITERATIONS):
         rewards, value_estimates, dones, last_value
     )
 
-    print("iter mean reward", jnp.mean(rewards))
+    print("iter mean return", jnp.mean(returns))
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     for epoch in range(K):
@@ -241,7 +241,7 @@ for iteration in range(ITERATIONS):
 env.close()
 
 # EVAL
-env = gym.make("LunarLander-v3", render_mode="human")
+env = gym.make("CartPole-v1", render_mode="human")
 observation, _ = env.reset(seed=42)
 for _ in range(1000):
     key, subkey = jax.random.split(key)
