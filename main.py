@@ -159,7 +159,7 @@ def calculate_gae_returns(
 
 
 def step_once(carry, _):
-    (key, model_state, env_state, last_observation) = carry
+    key, model_state, env_state, last_observation = carry
     model = nnx.merge(*model_state)
 
     key, subkey = jax.random.split(key)
