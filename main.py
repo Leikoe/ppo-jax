@@ -1,23 +1,22 @@
 import distrax
-import gymnasium as gym
+import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
-from tqdm import tqdm
-
-orthogonal = nnx.nn.initializers.orthogonal
-constant = nnx.nn.initializers.constant
+from flax.nnx.nn.initializers import constant, orthogonal
 
 BATCH_SIZE = 256
 MAX_STEPS = 1024
-NUM_ENVS = 1
-ITERATIONS = 50
+NUM_ENVS = 16
+ITERATIONS = 1
 K = 5
 EPS = 0.1
 DISCOUNT_FACTOR = 0.99
 GAE_LAMBDA = 0.95
+
+ENV_NAME = "Acrobot-v1"
 
 
 class Model(nnx.Module):
@@ -112,14 +111,9 @@ def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array:
 def loss_fn(
     model, observations, actions, values, actions_log_probs, advantages, returns
 ):
-    observations = jax.lax.stop_gradient(observations)
-    actions = jax.lax.stop_gradient(actions)
-    values = jax.lax.stop_gradient(values)
-    actions_log_probs = jax.lax.stop_gradient(actions_log_probs)
-    advantages = jax.lax.stop_gradient(advantages)
-    returns = jax.lax.stop_gradient(returns)
-
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = (advantages - advantages.mean()) / (
+        advantages.std() + 1e-8
+    )  # standardize advantages
 
     pi, value = model(observations)
     value = value.flatten()
@@ -129,18 +123,29 @@ def loss_fn(
     )  # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
 
     policy_loss = -jnp.mean(
-        jnp.minimum(  # loss is -L_CLIP because we want to maximize L_CLIP but using gradient descent
+        jnp.minimum(
             prob_ratio * advantages,
             jnp.clip(prob_ratio, min=1.0 - EPS, max=1.0 + EPS) * advantages,
         )
-    )
+    )  # policy_loss is -L_CLIP because we want to maximize L_CLIP but using gradient descent
     value_loss = jnp.mean(jnp.square(value - returns))
     entropy_loss = -jnp.mean(pi.entropy())
     return policy_loss + 0.5 * value_loss + 0.001 * entropy_loss
 
 
-def calculate_gae_returns(rewards, values, dones, last_value):
+def calculate_gae_returns(
+    rewards,  # (N, T)
+    values,  # (N, T)
+    dones,  # (N, T)
+    last_value,  # (N,)
+):
     """adapted from https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo.py#L142"""
+
+    rewards, values, dones = (
+        rewards.T,
+        values.T,
+        dones.T,
+    )  # scan expects to run T times, calling _get_advantages to compute N in parallel
 
     def _get_advantages(gae_and_next_value, reward_value_done):
         gae, next_value = gae_and_next_value
@@ -151,17 +156,49 @@ def calculate_gae_returns(rewards, values, dones, last_value):
 
     _, advantages = jax.lax.scan(
         _get_advantages,
-        (jnp.zeros_like(last_value), last_value),
+        (
+            jnp.zeros_like(last_value),  # gae_t = delta_t
+            last_value,  # v_(t+1) = last_value
+        ),
         (rewards, values, dones),
         reverse=True,  # scanning the trajectory batch in reverse order
     )
     return advantages, advantages + values  # advantages + values = returns
 
 
+def step_once(carry, _):
+    (model_state, env_state, key, last_observation) = carry
+    model = nnx.merge(*model_state)
+
+    key, subkey = jax.random.split(key)
+    action, log_prob, value = get_action_logprobs_value(model, last_observation, subkey)
+
+    # observation, reward, terminated, truncated, info = env.step(action)
+    observation, env_state, reward, done, _ = vmap_step(
+        jax.random.split(subkey, NUM_ENVS), env_state, action, env_params
+    )
+
+    # observation, state = jnp.where(done, vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params), (observation, env_state))
+    # if done:
+    #     observation, _ = env.reset()
+    return (model_state, env_state, key, observation), (
+        observation,
+        value.flatten(),
+        action,
+        log_prob,
+        reward,
+        done,
+    )
+
+
 SEED = 7
 key = jax.random.key(SEED)
-env = gym.make("LunarLander-v3")
-model = Model(8, 128, 4)  # lunar lander has obs (8,) and action(1,) in [0,3] range
+# init envs
+env, env_params = gymnax.make(ENV_NAME)
+vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
+
+model = Model(6, 128, 3)  # Acrobot has obs (6,) and action (1,) in [0,3] range
 optimizer = nnx.Optimizer(
     model,
     optax.chain(
@@ -172,52 +209,43 @@ optimizer = nnx.Optimizer(
 
 value_and_grad_loss_fn = nnx.value_and_grad(loss_fn)
 
+jitted_calculate_gae_returns = jax.jit(calculate_gae_returns)
+
 for iteration in range(ITERATIONS):
     print(f"{iteration=}")
-    observations = []
-    value_estimates = []
-    actions = []
-    actions_log_probs = []
-    rewards = []
-    dones = []
-
-    done_rewards = []
-
     # single actor for now so no loop
     # Run policy πθold in environment for T timesteps
-    observation, _ = env.reset()
-    for step in tqdm(range(MAX_STEPS)):
-        key, subkey = jax.random.split(key)
-        action, log_probs, value = get_action_logprobs_value(model, observation, subkey)
-        action, value = action.item(), value.item()
+    init_keys = jax.random.split(key, NUM_ENVS)
+    observation, state = vmap_reset(init_keys, env_params)
 
-        observations.append(observation)
-        value_estimates.append(value)
-        actions.append(action)
-        actions_log_probs.append(log_probs)
-        observation, reward, terminated, truncated, info = env.step(action)
-        rewards.append(float(reward))
+    model_state = nnx.split(model)  # graphdef, state
+    (_, _, key, last_observation), trajectory = jax.lax.scan(
+        step_once, (model_state, state, key, observation), length=MAX_STEPS
+    )
 
-        dones.append(terminated or truncated)
-        if terminated or truncated:
-            done_rewards.append(float(reward))
-            observation, _ = env.reset()
-    key, subkey = jax.random.split(key)
+    (observations, values, actions, log_probs, rewards, dones) = jax.tree.map(
+        lambda x: x.swapaxes(0, 1),
+        trajectory,
+    )  # (NUM_ENVS, MAX_STEPS, *)
+
     last_value = get_value(
-        model, observation
-    ).item()  # one more required for gae's deltas
+        model, last_observation
+    ).flatten()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-    observations = jnp.array(observations)
-    value_estimates = jnp.array(value_estimates)
-    actions = jnp.array(actions)
-    actions_log_probs = jnp.array(actions_log_probs)
-    rewards = jnp.array(rewards)
-    dones = jnp.array(dones)
+    advantages, returns = jitted_calculate_gae_returns(
+        rewards, values, dones, last_value
+    )  # (T, N)
 
-    advantages, returns = calculate_gae_returns(
-        rewards, value_estimates, dones, last_value
-    )
+    # flatten NUM_ENVS * MAX_STEPS of experience
+    (observations, values, actions, log_probs, rewards, dones, advantages, returns) = (
+        jax.tree.map(
+            lambda x: x.flatten()
+            if len(x.shape) == 2
+            else x.reshape(MAX_STEPS * NUM_ENVS, -1),
+            (*trajectory, advantages, returns),
+        )
+    )  # (NUM_ENVS * MAX_STEPS, *)
 
     print("iter mean reward", jnp.mean(rewards))
 
@@ -232,16 +260,17 @@ for iteration in range(ITERATIONS):
                 model,
                 observations[batch_idxs],
                 actions[batch_idxs],
-                value_estimates[batch_idxs],
-                actions_log_probs[batch_idxs],
+                values[batch_idxs],
+                log_probs[batch_idxs],
                 advantages[batch_idxs],
                 returns[batch_idxs],
             )
             optimizer.update(grads)  # inplace updates
-env.close()
 
 # EVAL
-env = gym.make("LunarLander-v3", render_mode="human")
+import gymnasium as gym
+
+env = gym.make(ENV_NAME, render_mode="human")
 observation, _ = env.reset(seed=42)
 for _ in range(1000):
     key, subkey = jax.random.split(key)
