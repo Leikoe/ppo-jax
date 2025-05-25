@@ -11,7 +11,8 @@ orthogonal = nnx.nn.initializers.orthogonal
 constant = nnx.nn.initializers.constant
 
 BATCH_SIZE = 256
-MAX_STEPS = 2048
+MAX_STEPS = 1024
+NUM_ENVS = 1
 ITERATIONS = 50
 K = 5
 EPS = 0.1
@@ -207,33 +208,26 @@ for iteration in range(ITERATIONS):
     ).item()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-
     observations = jnp.array(observations)
     value_estimates = jnp.array(value_estimates)
     actions = jnp.array(actions)
     actions_log_probs = jnp.array(actions_log_probs)
     rewards = jnp.array(rewards)
     dones = jnp.array(dones)
-    # print(observations.shape, value_estimates.shape, actions.shape, rewards.shape, dones.shape)
-
-    # advantages = jnp.array(advantages)
-    # returns = advantages + value_estimates
 
     advantages, returns = calculate_gae_returns(
         rewards, value_estimates, dones, last_value
     )
 
     print("iter mean reward", jnp.mean(rewards))
-    print(f"done rewards {done_rewards}")
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     for epoch in range(K):
-        # print(f"{epoch=}")
-        for batch in range(len(observations) // BATCH_SIZE):
-            key, _key = jax.random.split(key)
-            batch_idxs = jax.random.randint(
-                _key, shape=(BATCH_SIZE,), minval=0, maxval=len(observations)
-            )
+        key, _key = jax.random.split(key)
+        idxs = jax.random.permutation(_key, jnp.arange(0, NUM_ENVS * MAX_STEPS))
+        batches_idxs = idxs.reshape(-1, BATCH_SIZE)
+        for batch_i in range(NUM_ENVS * MAX_STEPS // BATCH_SIZE):
+            batch_idxs = batches_idxs[batch_i]
             loss, grads = value_and_grad_loss_fn(
                 model,
                 observations[batch_idxs],
