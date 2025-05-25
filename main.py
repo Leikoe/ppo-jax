@@ -10,7 +10,7 @@ from flax.nnx.nn.initializers import constant, orthogonal
 SEED = 7
 BATCH_SIZE = 256
 MAX_STEPS = 1024
-NUM_ENVS = 16
+NUM_ENVS = 1
 ITERATIONS = 50
 K = 5
 EPS = 0.1
@@ -18,6 +18,14 @@ DISCOUNT_FACTOR = 0.99
 GAE_LAMBDA = 0.95
 
 ENV_NAME = "Acrobot-v1"
+OPTIMIZER = optax.chain(
+    optax.clip_by_global_norm(0.5),
+    optax.adamw(1e-3),
+)
+
+env, env_params = gymnax.make(ENV_NAME)
+vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
 
 class Model(nnx.Module):
@@ -132,18 +140,12 @@ def loss_fn(
 
 
 def calculate_gae_returns(
-    rewards,  # (N, T)
-    values,  # (N, T)
-    dones,  # (N, T)
+    rewards,  # (T, N)
+    values,  # (T, N)
+    dones,  # (T, N)
     last_value,  # (N,)
 ):
     """adapted from https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo.py#L142"""
-
-    rewards, values, dones = (
-        rewards.T,
-        values.T,
-        dones.T,
-    )  # scan expects to run T times, calling _get_advantages to compute N in parallel
 
     def _get_advantages(gae_and_next_value, reward_value_done):
         gae, next_value = gae_and_next_value
@@ -171,14 +173,11 @@ def step_once(carry, _):
     key, subkey = jax.random.split(key)
     action, log_prob, value = get_action_logprobs_value(model, last_observation, subkey)
 
-    # observation, reward, terminated, truncated, info = env.step(action)
+    # Automatic env resetting in gymnax step!
     observation, env_state, reward, done, _ = vmap_step(
         jax.random.split(subkey, NUM_ENVS), env_state, action, env_params
     )
 
-    # observation, state = jnp.where(done, vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params), (observation, env_state))
-    # if done:
-    #     observation, _ = env.reset()
     return (key, model_state, env_state, observation), (
         observation,
         value.flatten(),
@@ -189,35 +188,21 @@ def step_once(carry, _):
     )
 
 
-env, env_params = gymnax.make(ENV_NAME)
-vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
-vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
-
-
-key = jax.random.key(SEED)
-model = Model(6, 128, 3)  # Acrobot has obs (6,) and action (1,) in [0,3] range
-optimizer = optax.chain(
-    optax.clip_by_global_norm(0.5),
-    optax.adamw(1e-3),
-)
-optimizer_state = optimizer.init(nnx.state(model, nnx.Param))
-
-
 @jax.jit
 def iter_once(carry, i):
     key, model_state, optimizer_state = carry
+    key, subkey = jax.random.split(key)
     jax.debug.print("iteration {i}", i=i)
 
     # Run policy πθold in environment for T timesteps
-    observation, env_state = vmap_reset(jax.random.split(key, NUM_ENVS), env_params)
+    observation, env_state = vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params)
     (key, _, _, last_observation), trajectory = jax.lax.scan(
         step_once, (key, model_state, env_state, observation), length=MAX_STEPS
     )
 
-    (observations, values, actions, log_probs, rewards, dones) = jax.tree.map(
-        lambda x: x.swapaxes(0, 1),
-        trajectory,
-    )  # (NUM_ENVS, MAX_STEPS, *)
+    observations, values, actions, log_probs, rewards, dones = (
+        trajectory  # (MAX_STEPS, NUM_ENVS, *)
+    )
 
     last_value = get_value(
         nnx.merge(*model_state), last_observation
@@ -245,11 +230,13 @@ def iter_once(carry, i):
         (*trajectory, advantages, returns),
     )  # (NUM_ENVS * MAX_STEPS, *)
 
+    print(observations.shape)
+
     jax.debug.print("iter mean reward {r}", r=jnp.mean(rewards))
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     def one_epoch(carry, epoch):
-        (key, model_state, optimizer_state) = carry
+        key, model_state, optimizer_state = carry
         jax.debug.print("epoch {epoch}", epoch=epoch)
 
         key, subkey = jax.random.split(key)
@@ -257,7 +244,7 @@ def iter_once(carry, i):
         batches_idxs = idxs.reshape(-1, BATCH_SIZE)
 
         def one_batch(carry, batch_idxs):
-            (model_state, optimizer_state) = carry
+            model_state, optimizer_state = carry
             model = nnx.merge(*model_state)
 
             loss, grads = nnx.value_and_grad(loss_fn)(
@@ -272,7 +259,7 @@ def iter_once(carry, i):
 
             # pure optax update
             current_params = nnx.state(model, nnx.Param)
-            updates, optimizer_state = optimizer.update(
+            updates, optimizer_state = OPTIMIZER.update(
                 grads, optimizer_state, current_params
             )
             new_params = optax.apply_updates(current_params, updates)
@@ -292,22 +279,25 @@ def iter_once(carry, i):
     return (key, model_state, optimizer_state), None
 
 
-(key, model_state, optimizer_state), _ = jax.lax.scan(
-    iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
-)
-model = nnx.merge(*model_state)
+if __name__ == "__main__":
+    key = jax.random.key(SEED)
+    model = Model(6, 128, 3)  # Acrobot has obs (6,) and action (1,) in [0,3] range
+    optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
+    (key, model_state, optimizer_state), _ = jax.lax.scan(
+        iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
+    )
+    model = nnx.merge(*model_state)
 
+    # EVAL
+    import gymnasium as gym
 
-# EVAL
-import gymnasium as gym
+    env = gym.make(ENV_NAME, render_mode="human")
+    observation, _ = env.reset(seed=42)
+    for _ in range(1000):
+        key, subkey = jax.random.split(key)
+        action = get_action(model, observation, subkey).item()
+        observation, reward, terminated, truncated, _ = env.step(action)
+        if terminated or truncated:
+            observation, _ = env.reset()
 
-env = gym.make(ENV_NAME, render_mode="human")
-observation, _ = env.reset(seed=42)
-for _ in range(1000):
-    key, subkey = jax.random.split(key)
-    action = get_action(model, observation, subkey).item()
-    observation, reward, terminated, truncated, _ = env.step(action)
-    if terminated or truncated:
-        observation, _ = env.reset()
-
-env.close()
+    env.close()
