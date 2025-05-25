@@ -150,7 +150,7 @@ def calculate_gae_returns(
         _get_advantages,
         (
             jnp.zeros_like(last_value),  # gae_t = delta_t
-            last_value,  # v_(t+1) = last_value
+            last_value,  # v_(t+1) is last_value
         ),
         (rewards, values, dones),
         reverse=True,  # scanning the trajectory batch in reverse order

@@ -1,0 +1,7 @@
+distrax==0.1.5
+flax==0.10.6
+gymnasium==1.1.1
+gymnax==0.0.9
+jax[cuda12]==0.6.1
+numpy==2.2.6
+optax==0.2.4
