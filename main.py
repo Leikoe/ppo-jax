@@ -17,7 +17,7 @@ EPS = 0.1
 DISCOUNT_FACTOR = 0.99
 GAE_LAMBDA = 0.95
 
-ENV_NAME = "Acrobot-v1"
+ENV_NAME = "CartPole-v1"
 OPTIMIZER = optax.chain(
     optax.clip_by_global_norm(0.5),
     optax.adamw(1e-3),
@@ -230,9 +230,7 @@ def iter_once(carry, i):
         (*trajectory, advantages, returns),
     )  # (NUM_ENVS * MAX_STEPS, *)
 
-    print(observations.shape)
-
-    jax.debug.print("iter mean reward {r}", r=jnp.mean(rewards))
+    jax.debug.print("iter mean return: {r}", r=jnp.mean(returns))
 
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     def one_epoch(carry, epoch):
@@ -281,7 +279,7 @@ def iter_once(carry, i):
 
 if __name__ == "__main__":
     key = jax.random.key(SEED)
-    model = Model(6, 128, 3)  # Acrobot has obs (6,) and action (1,) in [0,3] range
+    model = Model(4, 128, 2)  # Acrobot has obs (6,) and action (1,) in [0,3] range
     optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
     (key, model_state, optimizer_state), _ = jax.lax.scan(
         iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
