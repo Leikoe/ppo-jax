@@ -98,6 +98,11 @@ def get_action_logprobs_value(
 
 
 @nnx.jit
+def get_value(model: Model, obs: jax.Array) -> jax.Array:
+    return model(obs)[1]
+
+
+@nnx.jit
 def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array:
     return model(obs)[0].sample(seed=key)
 
@@ -197,17 +202,11 @@ for iteration in range(ITERATIONS):
             done_rewards.append(float(reward))
             observation, _ = env.reset()
     key, subkey = jax.random.split(key)
-    last_value = get_action_logprobs_value(model, observation, subkey)[
-        2
-    ].item()  # one more required for gae's deltas
+    last_value = get_value(
+        model, observation
+    ).item()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-    # deltas: list[float] = [r + DISCOUNT_FACTOR * (1 - d) * nv - v for r, v, nv, d in zip(rewards, value_estimates[:-1], value_estimates[1:], dones)]
-    # gaes: list[float] = [deltas[-1]]
-    # for delta, done in reversed(list(zip(deltas[:-1], dones))):
-    #     discounted_last = 0. if done else DISCOUNT_FACTOR * GAE_LAMBDA * gaes[0]
-    #     gaes.insert(0, delta + discounted_last)
-    # advantages = gaes
 
     observations = jnp.array(observations)
     value_estimates = jnp.array(value_estimates)
@@ -248,8 +247,7 @@ for iteration in range(ITERATIONS):
 env.close()
 
 # EVAL
-env = gym.make("LunarLander-v3", render_mode="rgb_array")
-env = gym.wrappers.RecordVideo(env, video_folder="./videos", disable_logger=True)
+env = gym.make("LunarLander-v3", render_mode="human")
 observation, _ = env.reset(seed=42)
 for _ in range(1000):
     key, subkey = jax.random.split(key)
