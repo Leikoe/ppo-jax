@@ -178,7 +178,6 @@ def step_once(carry, _):
     )
 
 
-@jax.jit
 def iter_once(carry, i):
     key, model_state, optimizer_state = carry
     key, subkey = jax.random.split(key)
