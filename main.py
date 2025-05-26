@@ -8,6 +8,7 @@ import numpy as np
 import optax
 from flax import nnx
 from flax.nnx.nn.initializers import constant, orthogonal
+from gymnax.environments import spaces
 from jax.sharding import PartitionSpec as P
 
 print(jax.local_devices())
@@ -27,7 +28,7 @@ EPS = 0.1
 DISCOUNT_FACTOR = 0.99
 GAE_LAMBDA = 0.95
 
-ENV_NAME = "CartPole-v1"
+ENV_NAME = "Pendulum-v1"
 OPTIMIZER = optax.chain(
     optax.clip_by_global_norm(0.5),
     optax.adamw(1e-3),
@@ -46,10 +47,12 @@ class Model(nnx.Module):
         self,
         input_dim,
         hidden_dim,
-        num_actions,
+        action_dim,
+        continuous=False,
         dropout=0.1,
         rngs: nnx.Rngs = nnx.Rngs(0),
     ):
+        self.continuous = continuous
         self.policy = nnx.Sequential(
             nnx.Linear(
                 input_dim,
@@ -71,7 +74,7 @@ class Model(nnx.Module):
             nnx.relu,
             nnx.Linear(
                 hidden_dim,
-                num_actions,
+                action_dim,
                 rngs=rngs,
                 kernel_init=orthogonal(0.01),
                 bias_init=constant(0.0),
@@ -104,9 +107,13 @@ class Model(nnx.Module):
                 bias_init=constant(0.0),
             ),
         )
+        if self.continuous:
+            self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
-    def __call__(self, x: jax.Array) -> tuple[distrax.Categorical, jax.Array]:
+    def __call__(self, x: jax.Array) -> tuple[distrax.Distribution, jax.Array]:
         logits = self.policy(x)
+        if self.continuous:
+            return distrax.MultivariateNormalDiag(logits, jnp.exp(self.log_std.value)), self.value(x)
         return distrax.Categorical(logits), self.value(x)
 
 
@@ -191,7 +198,13 @@ def step_once(carry, _):
     )
 
 
-@partial(jax.shard_map, mesh=mesh, in_specs=(P("x"), None), out_specs=(P("x"), P("x")), check_vma=False)
+@partial(
+    jax.shard_map,
+    mesh=mesh,
+    in_specs=(P("x"), None),
+    out_specs=(P("x"), P("x")),
+    check_vma=False,
+)
 def collect_experience(keys, model_state):
     key = keys[0]  # keys was (1,)
     observation, env_state = vmap_reset(jax.random.split(key, NUM_ENVS_PER_DEVICE), env_params)
@@ -278,9 +291,15 @@ def iter_once(carry, i):
 
 if __name__ == "__main__":
     key = jax.random.key(SEED)
+
+    action_space = env.action_space(env_params)
+    continuous = isinstance(action_space, spaces.Box)
     model = Model(
-        env.observation_space(env_params).shape[0], 128, env.action_space(env_params).n
-    )  # Acrobot has obs (6,) and action (1,) in [0,3] range
+        env.observation_space(env_params).shape[0],
+        128,
+        action_space.shape[0] if continuous else action_space.n,
+        continuous=continuous,
+    )
     optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
     (key, model_state, optimizer_state), _ = jax.lax.scan(iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS))
     model = nnx.merge(*model_state)
@@ -292,7 +311,7 @@ if __name__ == "__main__":
     observation, _ = env.reset(seed=42)
     for _ in range(1000):
         key, subkey = jax.random.split(key)
-        action = get_action(model, observation, subkey).item()
+        action = np.array(get_action(model, observation, subkey))
         observation, reward, terminated, truncated, _ = env.step(action)
         if terminated or truncated:
             observation, _ = env.reset()
