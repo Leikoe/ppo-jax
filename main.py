@@ -16,10 +16,12 @@ NUM_DEVICES = jax.local_device_count()
 mesh = jax.make_mesh((NUM_DEVICES,), ("x",))
 
 SEED = 7
-BATCH_SIZE = 4096
+ITERATIONS = 50
 NUM_STEPS = 1024
 NUM_ENVS = 2048
-ITERATIONS = 50
+VALUE_COEF = 0.5
+ENTROPY_COEF = 0.001
+BATCH_SIZE = 4096
 K = 5
 EPS = 0.1
 DISCOUNT_FACTOR = 0.99
@@ -139,7 +141,7 @@ def loss_fn(model, observations, actions, values, actions_log_probs, advantages,
     )  # policy_loss is -L_CLIP because we want to maximize L_CLIP but using gradient descent
     value_loss = jnp.mean(jnp.square(value - returns))
     entropy_loss = -jnp.mean(pi.entropy())
-    return policy_loss + 0.5 * value_loss + 0.001 * entropy_loss
+    return policy_loss + VALUE_COEF * value_loss + ENTROPY_COEF * entropy_loss
 
 
 def calculate_gae_returns(
