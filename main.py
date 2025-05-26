@@ -8,9 +8,9 @@ from flax import nnx
 from flax.nnx.nn.initializers import constant, orthogonal
 
 SEED = 7
-BATCH_SIZE = 256
+BATCH_SIZE = 1024
 MAX_STEPS = 1024
-NUM_ENVS = 1
+NUM_ENVS = 512
 ITERATIONS = 50
 K = 5
 EPS = 0.1
@@ -252,7 +252,9 @@ def iter_once(carry, i):
 
 if __name__ == "__main__":
     key = jax.random.key(SEED)
-    model = Model(4, 128, 2)  # Acrobot has obs (6,) and action (1,) in [0,3] range
+    model = Model(
+        env.observation_space(env_params).shape[0], 128, env.action_space(env_params).n
+    )  # Acrobot has obs (6,) and action (1,) in [0,3] range
     optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
     (key, model_state, optimizer_state), _ = jax.lax.scan(iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS))
     model = nnx.merge(*model_state)
