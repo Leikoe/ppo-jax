@@ -169,7 +169,7 @@ def step_once(carry, _):
     observation, env_state, reward, done, _ = vmap_step(jax.random.split(subkey, NUM_ENVS), env_state, action, env_params)
 
     return (key, model_state, env_state, observation), (
-        observation,
+        last_observation,
         value.flatten(),
         action,
         log_prob,
