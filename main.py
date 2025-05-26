@@ -1,3 +1,5 @@
+from functools import partial
+
 import distrax
 import gymnax
 import jax
@@ -6,11 +8,17 @@ import numpy as np
 import optax
 from flax import nnx
 from flax.nnx.nn.initializers import constant, orthogonal
+from jax.sharding import PartitionSpec as P
+
+print(jax.local_devices())
+NUM_DEVICES = jax.local_device_count()
+
+mesh = jax.make_mesh((NUM_DEVICES,), ("x",))
 
 SEED = 7
-BATCH_SIZE = 1024
-MAX_STEPS = 1024
-NUM_ENVS = 512
+BATCH_SIZE = 4096
+NUM_STEPS = 1024
+NUM_ENVS = 2048
 ITERATIONS = 50
 K = 5
 EPS = 0.1
@@ -22,6 +30,9 @@ OPTIMIZER = optax.chain(
     optax.clip_by_global_norm(0.5),
     optax.adamw(1e-3),
 )
+
+assert NUM_ENVS % NUM_DEVICES == 0, "for parallel experience collection, NUM_ENVS should be divisible by NUM_DEVICES!"
+NUM_ENVS_PER_DEVICE = NUM_ENVS // NUM_DEVICES
 
 env, env_params = gymnax.make(ENV_NAME)
 vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
@@ -166,7 +177,7 @@ def step_once(carry, _):
     action, log_prob, value = get_action_logprobs_value(model, last_observation, subkey)
 
     # Automatic env resetting in gymnax step!
-    observation, env_state, reward, done, _ = vmap_step(jax.random.split(subkey, NUM_ENVS), env_state, action, env_params)
+    observation, env_state, reward, done, _ = vmap_step(jax.random.split(subkey, NUM_ENVS_PER_DEVICE), env_state, action, env_params)
 
     return (key, model_state, env_state, observation), (
         last_observation,
@@ -178,23 +189,38 @@ def step_once(carry, _):
     )
 
 
+@partial(jax.shard_map, mesh=mesh, in_specs=(P("x"), None), out_specs=(P("x"), P("x")), check_vma=False)
+def collect_experience(key, model_state):
+    key = key[0]
+    print(key)
+
+    observation, env_state = vmap_reset(jax.random.split(key, NUM_ENVS_PER_DEVICE), env_params)
+    env_state = jax.lax.pvary(env_state, "x")
+
+    (key, _, _, last_observation), trajectory = jax.lax.scan(step_once, (key, model_state, env_state, observation), length=NUM_STEPS)
+    return last_observation, jax.tree.map(lambda x: x.swapaxes(0, 1), trajectory)  # (NUM_ENVS_PER_DEVICE,), (NUM_ENVS_PER_DEVICE, NUM_STEPS, *)
+
+
 def iter_once(carry, i):
     key, model_state, optimizer_state = carry
     key, subkey = jax.random.split(key)
     jax.debug.print("iteration {i}", i=i)
 
     # Run policy πθold in environment for T timesteps
-    observation, env_state = vmap_reset(jax.random.split(subkey, NUM_ENVS), env_params)
-    (key, _, _, last_observation), trajectory = jax.lax.scan(step_once, (key, model_state, env_state, observation), length=MAX_STEPS)
+    per_device_key = jax.random.split(subkey, NUM_DEVICES)
+    last_observation, trajectory = collect_experience(
+        per_device_key, model_state
+    )  # (NUM_DEVICES * NUM_ENVS_PER_DEVICE,), (NUM_DEVICES * NUM_ENVS_PER_DEVICE, NUM_STEPS, *)
 
-    observations, values, actions, log_probs, rewards, dones = trajectory  # (MAX_STEPS, NUM_ENVS, *)
+    trajectory = jax.tree.map(lambda x: x.swapaxes(0, 1), trajectory)  # (NUM_STEPS, NUM_ENVS, *)
+    observations, values, actions, log_probs, rewards, dones = trajectory  # (NUM_STEPS, NUM_ENVS, *)
 
     last_value = get_value(nnx.merge(*model_state), last_observation).flatten()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
     advantages, returns = calculate_gae_returns(rewards, values, dones, last_value)  # (T, N)
 
-    # flatten NUM_ENVS * MAX_STEPS of experience
+    # flatten NUM_ENVS * NUM_STEPS of experience
     (
         observations,
         values,
@@ -205,9 +231,9 @@ def iter_once(carry, i):
         advantages,
         returns,
     ) = jax.tree.map(
-        lambda x: x.flatten() if len(x.shape) == 2 else x.reshape(MAX_STEPS * NUM_ENVS, -1),
+        lambda x: x.flatten() if len(x.shape) == 2 else x.reshape(NUM_STEPS * NUM_ENVS, -1),
         (*trajectory, advantages, returns),
-    )  # (NUM_ENVS * MAX_STEPS, *)
+    )  # (NUM_ENVS * NUM_STEPS, *)
 
     jax.debug.print("iter mean return: {r}", r=jnp.mean(returns))
 
@@ -217,7 +243,7 @@ def iter_once(carry, i):
         jax.debug.print("epoch {epoch}", epoch=epoch)
 
         key, subkey = jax.random.split(key)
-        idxs = jax.random.permutation(subkey, NUM_ENVS * MAX_STEPS)
+        idxs = jax.random.permutation(subkey, NUM_ENVS * NUM_STEPS)
         batches_idxs = idxs.reshape(-1, BATCH_SIZE)
 
         def one_batch(carry, batch_idxs):
